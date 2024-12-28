@@ -1,327 +1,308 @@
 package client
 
 import (
-	"crypto/aes"
-	"crypto/cipher"
-	"crypto/rand"
 	"encoding/binary"
 	"fmt"
 	"io"
-	"log"
 	"net"
-	"strings"
 	"sync"
 	"time"
 
 	"reverseproxy/crypto"
+	"reverseproxy/logger"
 	"reverseproxy/tunnel"
 
-	"github.com/spf13/cobra"
+	"github.com/xtaci/kcp-go"
 )
 
-// 定义 msgTypeNewConn 和 msgTypeData
-const (
-	msgTypeNewConn = uint8(1) // 新连接请求
-	msgTypeData    = uint8(2) // 数据传输
-)
-
-// 定义 Connection 结构体
-type Connection struct {
+// connection 表示一个活跃的连接
+type connection struct {
 	id         uint32
 	targetConn net.Conn
+	lastActive time.Time
 }
 
-// 代理客户端
-type ProxyClient struct {
-	serverHost  string
-	tunnelPort  int
-	encryptor   Encryptor
-	activeConns sync.Map // 活跃的连接映射，key为connID
+// Client 客户端结构体
+type Client struct {
+	serverAddr   string
+	protocol     string
+	encryptor    crypto.Encryptor
+	tunnel       *tunnel.Tunnel
+	kcpConfig    *tunnel.KCPConfig
+	done         chan struct{}
+	activeConns  sync.Map
+	nextConnID   uint32
+	readTimeout  time.Duration
+	writeTimeout time.Duration
 }
 
-// 添加 Encryptor 接口和 AESEncryptor 结构体
-// 加密相关结构和方法
-type Encryptor interface {
-	Encrypt([]byte) ([]byte, error)
-	Decrypt([]byte) ([]byte, error)
-}
-
-type AESEncryptor struct {
-	key []byte
-}
-
-func NewAESEncryptor(key []byte) (*AESEncryptor, error) {
-	if len(key) != 32 {
-		key = padKey(key, 32)
-	}
-	return &AESEncryptor{key: key}, nil
-}
-
-func padKey(key []byte, size int) []byte {
-	padded := make([]byte, size)
-	copy(padded, key)
-	return padded
-}
-
-func (a *AESEncryptor) Encrypt(plaintext []byte) ([]byte, error) {
-	block, err := aes.NewCipher(a.key)
+// NewClient 创建新的客户端
+func NewClient(serverAddr string, key []byte, protocol string) (*Client, error) {
+	encryptor, err := crypto.NewAESEncryptor(key)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("创建加密器失败: %v", err)
 	}
 
-	gcm, err := cipher.NewGCM(block)
-	if err != nil {
-		return nil, err
-	}
-
-	nonce := make([]byte, gcm.NonceSize())
-	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
-		return nil, err
-	}
-
-	return gcm.Seal(nonce, nonce, plaintext, nil), nil
+	return &Client{
+		serverAddr:   serverAddr,
+		protocol:     protocol,
+		encryptor:    encryptor,
+		kcpConfig:    tunnel.DefaultKCPConfig(),
+		done:         make(chan struct{}),
+		readTimeout:  30 * time.Second,
+		writeTimeout: 30 * time.Second,
+	}, nil
 }
 
-func (a *AESEncryptor) Decrypt(ciphertext []byte) ([]byte, error) {
-	block, err := aes.NewCipher(a.key)
-	if err != nil {
-		return nil, err
-	}
-
-	gcm, err := cipher.NewGCM(block)
-	if err != nil {
-		return nil, err
-	}
-
-	nonceSize := gcm.NonceSize()
-	if len(ciphertext) < nonceSize {
-		return nil, err
-	}
-
-	nonce, ciphertext := ciphertext[:nonceSize], ciphertext[nonceSize:]
-	return gcm.Open(nil, nonce, ciphertext, nil)
-}
-
-var (
-	key        string
-	serverHost string
-	tunnelPort int
-)
-
-func RunClient(cmd *cobra.Command, args []string) {
-	// 获取命令行参数
-	serverHost, err := cmd.Flags().GetString("server")
-	if err != nil {
-		log.Fatal(err)
-	}
-	tunnelPort, err := cmd.Flags().GetInt("tunnel")
-	if err != nil {
-		log.Fatal(err)
-	}
-	key, err := cmd.Flags().GetString("key")
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	log.Printf("serverHost: %s, tunnelPort: %d, key: %s", serverHost, tunnelPort, key)
-
-	encryptor, err := crypto.NewAESEncryptor([]byte(key))
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	client := &ProxyClient{
-		serverHost: serverHost,
-		tunnelPort: tunnelPort,
-		encryptor:  encryptor,
-	}
-
-	for {
-		if err := client.connectToServer(); err != nil {
-			log.Printf("连接服务器失败: %v, 5秒后重试\n", err)
-			time.Sleep(5 * time.Second)
-			continue
-		}
-	}
-}
-
-func (c *ProxyClient) connectToServer() error {
+// Start 启动客户端
+func (c *Client) Start() error {
 	// 连接到服务器
-	conn, err := net.Dial("tcp", fmt.Sprintf("%s:%d", c.serverHost, c.tunnelPort))
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
+	var conn net.Conn
+	var err error
 
-	log.Printf("已连接到服务器 %s:%d\n", c.serverHost, c.tunnelPort)
-
-	tunnel := tunnel.NewTunnel(conn, c.encryptor)
-
-	// 处理来��服务器的请求
-	for {
-		data, err := tunnel.Read()
+	if c.protocol == "kcp" {
+		// 使用KCP协议
+		kcpConn, err := kcp.DialWithOptions(c.serverAddr, nil, 10, 3)
 		if err != nil {
-			return fmt.Errorf("读取服务器数据错误: %v", err)
+			return fmt.Errorf("KCP连接服务器失败: %v", err)
 		}
-
-		if len(data) == 0 {
-			continue
+		// 设置基础的KCP参数
+		if err := kcpConn.SetDSCP(46); err != nil {
+			logger.Warn("设置KCP DSCP失败: %v", err)
 		}
+		if err := kcpConn.SetReadBuffer(4194304); err != nil {
+			logger.Warn("设置KCP读缓冲区失败: %v", err)
+		}
+		if err := kcpConn.SetWriteBuffer(4194304); err != nil {
+			logger.Warn("设置KCP写缓冲区失败: %v", err)
+		}
+		// 应用KCP配置
+		tunnel.ApplyKCPConfig(kcpConn, c.kcpConfig)
+		logger.Debug("已应用KCP配置: MTU=%d, 窗口大小=%d/%d",
+			c.kcpConfig.MTU, c.kcpConfig.SndWnd, c.kcpConfig.RcvWnd)
+		conn = kcpConn
+	} else {
+		conn, err = net.DialTimeout("tcp", c.serverAddr, c.readTimeout)
+		if err != nil {
+			return fmt.Errorf("TCP连接服务器失败: %v", err)
+		}
+	}
 
-		// 根据消息类型处理
-		switch data[0] {
-		case msgTypeNewConn:
-			// 同步处理新连接请求，确保响应能够及时发送
-			c.handleNewConnection(data[1:], tunnel)
-		case msgTypeData:
-			// 处理数据消息
-			if len(data) < 5 {
-				log.Printf("无效的数据消息: ��据太短\n")
+	// 创建隧道
+	c.tunnel = tunnel.NewTunnel(conn, c.encryptor)
+
+	// 执行隧道握手
+	if err := c.tunnel.Handshake(false); err != nil {
+		return fmt.Errorf("隧道握手失败: %v", err)
+	}
+
+	// 启动心跳
+	go c.heartbeat()
+
+	// 处理隧道消息
+	go c.handleTunnelMessages()
+
+	logger.Info("已连接到服务器: %s", c.serverAddr)
+
+	// 等待退出信号
+	<-c.done
+
+	return nil
+}
+
+// heartbeat 发送心跳包
+func (c *Client) heartbeat() {
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-c.done:
+			return
+		case <-ticker.C:
+			// 发送心跳包
+			heartbeat := []byte{0} // 0表示心跳包
+			if err := c.tunnel.Write(heartbeat); err != nil {
+				logger.Error("发送心跳包失败: %v", err)
+				return
+			}
+		}
+	}
+}
+
+// handleTunnelMessages 处理隧道消息
+func (c *Client) handleTunnelMessages() {
+	for {
+		select {
+		case <-c.done:
+			return
+		default:
+			// 读取消息
+			data, err := c.tunnel.Read()
+			if err != nil {
+				logger.Error("读取隧道消息失败: %v", err)
+				return
+			}
+
+			if len(data) == 0 {
 				continue
 			}
-			connID := binary.BigEndian.Uint32(data[1:5])
-			if conn, ok := c.activeConns.Load(connID); ok {
-				if activeConn, ok := conn.(*Connection); ok {
-					if _, err := activeConn.targetConn.Write(data[5:]); err != nil {
-						log.Printf("[连接 %d] 写入目标��务数据错误: %v\n", connID, err)
-					}
+
+			// 处理消息
+			switch data[0] {
+			case 0: // 心跳包
+				continue
+			case 1: // 新连接请求
+				if err := c.handleNewConnection(data[1:]); err != nil {
+					logger.Error("处理新连接请求失败: %v", err)
 				}
+			case 2: // 数据转发
+				if err := c.handleData(data[1:]); err != nil {
+					logger.Error("处理数据转发失败: %v", err)
+				}
+			default:
+				logger.Error("未知消息类型: %d", data[0])
 			}
-		default:
-			log.Printf("未知的消息类型: %d\n", data[0])
 		}
 	}
 }
 
-// 添加 handleNewConnection 方法
-func (c *ProxyClient) handleNewConnection(data []byte, controlTunnel *tunnel.Tunnel) {
-	log.Printf("收到新连接请求，数据长度: %d", len(data))
-
-	if len(data) < 7 { // 至少需要 connID(4) + ver(1) + cmd(1) + atyp(1)
-		log.Printf("无效的连接请求: 数据太短\n")
-		return
+// handleNewConnection 处理新连接请求
+func (c *Client) handleNewConnection(data []byte) error {
+	if len(data) < 4 {
+		return fmt.Errorf("新连接数据长度不足")
 	}
 
+	// 解析连接ID和目标地址
 	connID := binary.BigEndian.Uint32(data[:4])
-	socks5Req := data[4:] // 完整的 SOCKS5 请求
+	targetAddr := string(data[4:])
 
-	log.Printf("SOCKS5请求数据(hex): % x", socks5Req)
-	log.Printf("SOCKS5请求解析: VER=%d, CMD=%d, RSV=%d, ATYP=%d",
-		socks5Req[0], socks5Req[1], socks5Req[2], socks5Req[3])
-
-	// 解析 SOCKS5 请求
-	if socks5Req[0] != 5 {
-		log.Printf("不支持的 SOCKS 版本: %d\n", socks5Req[0])
-		return
-	}
-
-	// 获取目标地址和端口
-	var addr string
-	var port uint16
-	idx := 3 // 跳过 VER, CMD, RSV
-
-	log.Printf("开始解析地址，剩余数据长度: %d", len(socks5Req[idx:]))
-
-	switch socks5Req[idx] {
-	case 1: // IPv4
-		if len(socks5Req[idx:]) < 7 { // atyp(1) + ip(4) + port(2)
-			log.Printf("IPv4数据不完整: 需要7字节，实际%d字节", len(socks5Req[idx:]))
-			return
-		}
-		ip := net.IPv4(socks5Req[idx+1], socks5Req[idx+2], socks5Req[idx+3], socks5Req[idx+4])
-		addr = ip.String()
-		port = binary.BigEndian.Uint16(socks5Req[idx+5 : idx+7])
-	case 3: // Domain
-		if len(socks5Req[idx:]) < 2 {
-			log.Printf("域名长度数据不完整: 剩余%d字节", len(socks5Req[idx:]))
-			return
-		}
-		domainLen := int(socks5Req[idx+1])
-		log.Printf("域名长度字节: %d", domainLen)
-		if domainLen > 255 {
-			log.Printf("域名长度异常: %d", domainLen)
-			return
-		}
-		expectedLen := 1 + domainLen + 2 // lenByte(1) + domain(domainLen) + port(2)
-		if len(socks5Req[idx:]) < expectedLen {
-			log.Printf("域名数据不完整: 需要%d字节，实际%d字节",
-				expectedLen, len(socks5Req[idx:]))
-			return
-		}
-		addr = string(socks5Req[idx+2 : idx+2+domainLen])
-		if strings.Contains(addr, "\x00") {
-			log.Printf("域名包含空字符")
-			return
-		}
-		log.Printf("解析到域名: %s", addr)
-		port = binary.BigEndian.Uint16(socks5Req[idx+2+domainLen : idx+2+domainLen+2])
-	case 4: // IPv6
-		if len(socks5Req[idx:]) < 19 { // atyp(1) + ip(16) + port(2)
-			log.Printf("IPv6数据不完整: 需要19字节，实际%d字节", len(socks5Req[idx:]))
-			return
-		}
-		ip := net.IP(socks5Req[idx+1 : idx+17])
-		addr = ip.String()
-		port = binary.BigEndian.Uint16(socks5Req[idx+17 : idx+19])
-	default:
-		log.Printf("不支持的地址类型: %d\n", socks5Req[idx])
-		return
-	}
-
-	log.Printf("收到连接请求 ID: %d, 目标: %s:%d\n", connID, addr, port)
-
-	// 连接目标服务器
-	targetConn, err := net.Dial("tcp", fmt.Sprintf("%s:%d", addr, port))
+	// 连接到目标地址
+	targetConn, err := net.DialTimeout("tcp", targetAddr, c.readTimeout)
 	if err != nil {
-		log.Printf("[连接 %d] 连接目标服务器失败: %v\n", connID, err)
-		return
+		// 发送连接失败响应
+		response := make([]byte, 5)
+		response[0] = 1 // 新连接响应
+		binary.BigEndian.PutUint32(response[1:], connID)
+		if err := c.tunnel.Write(response); err != nil {
+			logger.Error("发送连接失败响应失败: %v", err)
+		}
+		return fmt.Errorf("连接目标地址失败: %v", err)
+	}
+
+	// 创建连接对象
+	conn := &connection{
+		id:         connID,
+		targetConn: targetConn,
+		lastActive: time.Now(),
 	}
 
 	// 存储连接
-	c.activeConns.Store(connID, &Connection{
-		id:         connID,
-		targetConn: targetConn,
-	})
+	c.activeConns.Store(connID, conn)
 
-	log.Printf("建立连接ID: %d 到目标: %s:%d\n", connID, addr, port)
+	logger.Debug("新建连接 %d -> %s", connID, targetAddr)
 
-	// 发送连接成功响应给服务器
+	// 发送连接成功响应
 	response := make([]byte, 5)
-	response[0] = msgTypeNewConn
-	binary.BigEndian.PutUint32(response[1:5], connID)
-	if err := controlTunnel.Write(response); err != nil {
-		log.Printf("发送连接响应失败: %v\n", err)
+	response[0] = 1 // 新连接响应
+	binary.BigEndian.PutUint32(response[1:], connID)
+	if err := c.tunnel.Write(response); err != nil {
 		targetConn.Close()
 		c.activeConns.Delete(connID)
-		return
+		return fmt.Errorf("发送连接成功响应失败: %v", err)
 	}
 
 	// 启动数据转发
-	go func() {
-		defer func() {
-			targetConn.Close()
-			c.activeConns.Delete(connID)
-			log.Printf("[连接 %d] 已关闭\n", connID)
-		}()
+	go c.forwardData(conn)
 
-		buf := make([]byte, 4096)
-		for {
-			n, err := targetConn.Read(buf)
-			if err != nil {
-				if err != io.EOF {
-					log.Printf("[连接 %d] 读取目标服务器数据错误: %v\n", connID, err)
-				}
-				return
+	return nil
+}
+
+// handleData 处理数据转发
+func (c *Client) handleData(data []byte) error {
+	if len(data) < 4 {
+		return fmt.Errorf("数据长度不足")
+	}
+
+	// 解析连接ID
+	connID := binary.BigEndian.Uint32(data[:4])
+	payload := data[4:]
+
+	// 获取连接
+	connInterface, ok := c.activeConns.Load(connID)
+	if !ok {
+		return fmt.Errorf("未找到连接: %d", connID)
+	}
+
+	conn := connInterface.(*connection)
+	conn.lastActive = time.Now()
+
+	// 发送数据到目标连接
+	if _, err := conn.targetConn.Write(payload); err != nil {
+		c.cleanupConnection(connID)
+		return fmt.Errorf("发送数据到目标连接失败: %v", err)
+	}
+
+	return nil
+}
+
+// forwardData 转发目标连接的数据到隧道
+func (c *Client) forwardData(conn *connection) {
+	defer c.cleanupConnection(conn.id)
+
+	buffer := make([]byte, 32*1024)
+	for {
+		// 读取目标连接数据
+		n, err := conn.targetConn.Read(buffer)
+		if err != nil {
+			if err != io.EOF {
+				logger.Error("读取目标连接数据失败: %v", err)
 			}
-
-			message := append([]byte{msgTypeData}, make([]byte, 4)...)
-			binary.BigEndian.PutUint32(message[1:5], connID)
-			message = append(message, buf[:n]...)
-
-			if err := controlTunnel.Write(message); err != nil {
-				log.Printf("[连接 %d] 发送数据到隧道错误: %v\n", connID, err)
-				return
-			}
+			return
 		}
-	}()
+
+		// 准备转发数据
+		data := make([]byte, n+5)
+		data[0] = 2 // 数据转发
+		binary.BigEndian.PutUint32(data[1:5], conn.id)
+		copy(data[5:], buffer[:n])
+
+		// 发送数据到隧道
+		if err := c.tunnel.Write(data); err != nil {
+			logger.Error("发送数据到隧道失败: %v", err)
+			return
+		}
+
+		conn.lastActive = time.Now()
+	}
+}
+
+// cleanupConnection 清理连接
+func (c *Client) cleanupConnection(connID uint32) {
+	if conn, ok := c.activeConns.Load(connID); ok {
+		activeConn := conn.(*connection)
+		activeConn.targetConn.Close()
+		c.activeConns.Delete(connID)
+		logger.Debug("清理连接 %d", connID)
+	}
+}
+
+// Close 关闭客户端
+func (c *Client) Close() error {
+	close(c.done)
+
+	// 关闭所有活跃连接
+	c.activeConns.Range(func(key, value interface{}) bool {
+		if conn, ok := value.(*connection); ok {
+			conn.targetConn.Close()
+		}
+		return true
+	})
+
+	// 关闭隧道
+	if c.tunnel != nil {
+		return c.tunnel.Close()
+	}
+
+	return nil
 }

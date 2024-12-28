@@ -1,0 +1,8 @@
+time="2024-12-29 00:22:47" level=info msg="等待隧道连接..."
+time="2024-12-29 00:22:48" level=info msg="已连接到服务器: localhost:7000"
+time="2024-12-29 00:22:48" level=info msg="隧道已连接"
+time="2024-12-29 00:22:48" level=info msg="SOCKS5代理已启动: :1080"
+time="2024-12-29 00:23:11" level=info msg="收到退出信号，正在关闭服务器和客户端..."
+time="2024-12-29 00:23:11" level=error msg="读取隧道消息失败: 读取数据长度失败: EOF"
+time="2024-12-29 00:23:11" level=error msg="读取隧道消息失败: 读取数据长度失败: read tcp [::1]:7000->[::1]:64017: use of closed network connection"
+time="2024-12-29 00:23:11" level=error msg="读取目标连接数据失败: read tcp 198.18.0.1:64074->198.18.1.41:443: use of closed network connection"

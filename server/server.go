@@ -4,625 +4,526 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"reverseproxy/crypto"
+	"reverseproxy/logger"
 	"reverseproxy/tunnel"
 
-	"github.com/spf13/cobra"
+	"github.com/xtaci/kcp-go"
 )
 
-const (
-	socks5Version = uint8(5)
-
-	// 认证方法
-	authNone     = uint8(0)
-	authPassword = uint8(2)
-
-	// 命令类型
-	cmdConnect = uint8(1)
-
-	// 地址类型
-	atypIPv4   = uint8(1)
-	atypDomain = uint8(3)
-	atypIPv6   = uint8(4)
-
-	// 响应状态
-	repSuccess         = uint8(0)
-	repServerFailure   = uint8(1)
-	repHostUnreachable = uint8(4)
-
-	// 添加一个新的消息类型常量
-	msgTypeNewConn = uint8(1) // 新连接请求
-	msgTypeData    = uint8(2) // 数据传输
-)
-
-var (
-	key        string
-	socksPort  int
-	tunnelPort int
-)
-
-// 定义 Connection 结构体
-type Connection struct {
+// connection 表示一个活跃的连接
+type connection struct {
 	id         uint32
-	targetConn net.Conn
+	localConn  net.Conn
 	lastActive time.Time
-	closed     int32
 }
 
-// 代理服务器
-type ProxyServer struct {
-	socksPort    int            // SOCKS5代理端口
-	tunnelPort   int            // 隧道端口
-	tunnel       *tunnel.Tunnel // 控制隧道连接
-	nextConnID   uint32         // 下一用的连接ID
-	mutex        sync.RWMutex
+// Server 服务器结构体
+type Server struct {
+	proxyAddr    string
+	tunnelAddr   string
+	protocol     string
 	encryptor    crypto.Encryptor
-	activeConns  sync.Map      // 活跃的连接映射，key为connID
-	tunnelReady  chan struct{} // 用于通知隧道就绪的通道
-	bufferPool   sync.Pool
-	maxConns     int
-	currentConns int32
-	// 连接参数
-	keepAliveInterval time.Duration
-	readTimeout       time.Duration
-	writeTimeout      time.Duration
-	credentials       map[string]string // 用户名和密码映射
+	tunnel       *tunnel.Tunnel
+	kcpConfig    *tunnel.KCPConfig
+	done         chan struct{}
+	activeConns  sync.Map
+	nextConnID   uint32
+	readTimeout  time.Duration
+	writeTimeout time.Duration
 }
 
-func RunServer(cmd *cobra.Command, args []string) {
-	// 获取命令行参数
-	socksPort, err := cmd.Flags().GetInt("socks")
+// NewServer 创建新的服务器
+func NewServer(proxyAddr, tunnelAddr string, key []byte, protocol string) (*Server, error) {
+	encryptor, err := crypto.NewAESEncryptor(key)
 	if err != nil {
-		log.Fatal(err)
-	}
-	tunnelPort, err := cmd.Flags().GetInt("tunnel")
-	if err != nil {
-		log.Fatal(err)
-	}
-	key, err := cmd.Flags().GetString("key")
-	if err != nil {
-		log.Fatal(err)
-	}
-	username, err := cmd.Flags().GetString("username")
-	if err != nil {
-		log.Fatal(err)
-	}
-	password, err := cmd.Flags().GetString("password")
-	if err != nil {
-		log.Fatal(err)
+		return nil, fmt.Errorf("创建加密器失败: %v", err)
 	}
 
-	log.Printf("socksPort: %d, tunnelPort: %d, key: %s, username: %s",
-		socksPort, tunnelPort, key, username)
+	return &Server{
+		proxyAddr:    proxyAddr,
+		tunnelAddr:   tunnelAddr,
+		protocol:     protocol,
+		encryptor:    encryptor,
+		kcpConfig:    tunnel.DefaultKCPConfig(),
+		done:         make(chan struct{}),
+		readTimeout:  30 * time.Second,
+		writeTimeout: 30 * time.Second,
+	}, nil
+}
 
-	encryptor, err := crypto.NewAESEncryptor([]byte(key))
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	server := &ProxyServer{
-		socksPort:   socksPort,
-		tunnelPort:  tunnelPort,
-		encryptor:   encryptor,
-		tunnelReady: make(chan struct{}),
-		bufferPool: sync.Pool{
-			New: func() interface{} {
-				return make([]byte, 32*1024) // 32KB 缓冲区
-			},
-		},
-		maxConns:          1000, // 最大并发连接数
-		keepAliveInterval: 30 * time.Second,
-		readTimeout:       2 * time.Minute,
-		writeTimeout:      30 * time.Second,
-		credentials: map[string]string{
-			username: password, // 使用命令行参数设置认证信息
-		},
-	}
-
-	// 启动 SOCKS5 服务
-	go func() {
-		listener, err := net.Listen("tcp", fmt.Sprintf(":%d", server.socksPort))
+// Start 启动服务器
+func (s *Server) Start() error {
+	// 启动隧道监听
+	var tunnelListener net.Listener
+	var err error
+	if s.protocol == "kcp" {
+		// 使用KCP协议
+		kcpListener, err := kcp.ListenWithOptions(s.tunnelAddr, nil, 10, 3)
 		if err != nil {
-			log.Fatal(err)
+			return fmt.Errorf("启动KCP隧道监听失败: %v", err)
 		}
-		defer listener.Close()
-
-		log.Printf("SOCKS5服务器正在监听端口 %d\n", server.socksPort)
-
-		for {
-			conn, err := listener.Accept()
-			if err != nil {
-				log.Printf("接受SOCKS5连接错误: %v\n", err)
-				continue
-			}
-
-			go func(conn net.Conn) {
-				defer conn.Close()
-				if err := handleSocks5(conn, server); err != nil {
-					log.Printf("处理SOCKS5连接错误: %v\n", err)
-				}
-			}(conn)
+		// 设置基础的KCP参数
+		if err := kcpListener.SetDSCP(46); err != nil {
+			logger.Warn("设置KCP DSCP失败: %v", err)
 		}
-	}()
-
-	// 启动隧道服务
-	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", server.tunnelPort))
-	if err != nil {
-		log.Fatal(err)
+		if err := kcpListener.SetReadBuffer(4194304); err != nil {
+			logger.Warn("设置KCP读缓冲区失败: %v", err)
+		}
+		if err := kcpListener.SetWriteBuffer(4194304); err != nil {
+			logger.Warn("设置KCP写缓冲区失败: %v", err)
+		}
+		tunnelListener = kcpListener
+	} else {
+		tunnelListener, err = net.Listen("tcp", s.tunnelAddr)
+		if err != nil {
+			return fmt.Errorf("启动TCP隧道监听失败: %v", err)
+		}
 	}
-	defer listener.Close()
+	defer tunnelListener.Close()
 
-	log.Printf("隧道服务器正在监听端口 %d\n", server.tunnelPort)
+	// 等待隧道连接
+	logger.Info("等待隧道连接...")
+	conn, err := tunnelListener.Accept()
+	if err != nil {
+		return fmt.Errorf("接受隧道连接失败: %v", err)
+	}
 
+	// 如果是KCP连接，应用KCP配置
+	if s.protocol == "kcp" {
+		if kcpConn, ok := conn.(*kcp.UDPSession); ok {
+			tunnel.ApplyKCPConfig(kcpConn, s.kcpConfig)
+			logger.Debug("已应用KCP配置: MTU=%d, 窗口大小=%d/%d",
+				s.kcpConfig.MTU, s.kcpConfig.SndWnd, s.kcpConfig.RcvWnd)
+		}
+	}
+
+	// 创建隧道
+	s.tunnel = tunnel.NewTunnel(conn, s.encryptor)
+
+	// 执行隧道握手
+	if err := s.tunnel.Handshake(true); err != nil {
+		return fmt.Errorf("隧道握手失败: %v", err)
+	}
+
+	// 启动心跳检测
+	go s.heartbeat()
+
+	// 处理隧道消息
+	go s.handleTunnelMessages()
+
+	logger.Info("隧道已连接")
+
+	// 启动SOCKS5代理监听
+	proxyListener, err := net.Listen("tcp", s.proxyAddr)
+	if err != nil {
+		return fmt.Errorf("启动SOCKS5代理监听失败: %v", err)
+	}
+	defer proxyListener.Close()
+
+	logger.Info("SOCKS5代理已启动: %s", s.proxyAddr)
+
+	// 处理SOCKS5连接
 	for {
-		conn, err := listener.Accept()
+		conn, err := proxyListener.Accept()
 		if err != nil {
-			log.Printf("接受隧道连接错误: %v\n", err)
+			logger.Error("接受SOCKS5连接失败: %v", err)
 			continue
 		}
 
-		go server.handleTunnel(conn)
+		go s.handleSocks5Connection(conn)
 	}
 }
 
-// generateConnID 生成唯一的连接ID
-func (s *ProxyServer) generateConnID() uint32 {
-	s.mutex.Lock()
-	defer s.mutex.Unlock()
-	s.nextConnID++
-	return s.nextConnID
-}
+// handleSocks5Connection 处理SOCKS5连接
+func (s *Server) handleSocks5Connection(conn net.Conn) {
+	defer conn.Close()
 
-func handleSocks5(conn net.Conn, server *ProxyServer) error {
-	// 检查并发连接数
-	if atomic.LoadInt32(&server.currentConns) >= int32(server.maxConns) {
-		return fmt.Errorf("达到最大连接数限制")
+	// 处理SOCKS5握手
+	if err := s.handleSocks5Handshake(conn); err != nil {
+		logger.Error("SOCKS5握手失败: %v", err)
+		return
 	}
-	atomic.AddInt32(&server.currentConns, 1)
-	defer atomic.AddInt32(&server.currentConns, -1)
 
-	// 设置 TCP 连接参数
-	if tcpConn, ok := conn.(*net.TCPConn); ok {
-		tcpConn.SetKeepAlive(true)
-		tcpConn.SetKeepAlivePeriod(30 * time.Second)
-		tcpConn.SetNoDelay(true) // 禁用 Nagle 算法，减少延迟
+	// 处理SOCKS5请求
+	targetAddr, err := s.handleSocks5Request(conn)
+	if err != nil {
+		logger.Error("处理SOCKS5请求失败: %v", err)
+		// 发送失败响应
+		response := []byte{5, 1, 0, 1, 0, 0, 0, 0, 0, 0}
+		conn.Write(response)
+		return
 	}
-	conn.SetDeadline(time.Now().Add(5 * time.Minute))
 
-	// 等待隧道就绪
-	log.Printf("等待隧道连接就绪...")
+	// 生成连接ID
+	connID := atomic.AddUint32(&s.nextConnID, 1)
+
+	// 创建连接对象
+	proxyConn := &connection{
+		id:         connID,
+		localConn:  conn,
+		lastActive: time.Now(),
+	}
+
+	// 存储连接
+	s.activeConns.Store(connID, proxyConn)
+	defer s.cleanupConnection(connID)
+
+	// 创建响应通道
+	responseChan := make(chan error, 1)
+	s.activeConns.Store(fmt.Sprintf("resp_%d", connID), responseChan)
+	defer s.activeConns.Delete(fmt.Sprintf("resp_%d", connID))
+
+	// 发送新连接请求给客户端
+	request := make([]byte, 5+len(targetAddr))
+	request[0] = 1 // 新连接请求
+	binary.BigEndian.PutUint32(request[1:5], connID)
+	copy(request[5:], []byte(targetAddr))
+
+	if err := s.tunnel.Write(request); err != nil {
+		logger.Error("发送新连接请求失败: %v", err)
+		// 发送失败响应
+		response := []byte{5, 1, 0, 1, 0, 0, 0, 0, 0, 0}
+		conn.Write(response)
+		return
+	}
+
+	// 等待客户端响应
 	select {
-	case <-server.tunnelReady:
-		log.Printf("隧道已就绪，开始处理SOCKS5请求")
-	case <-time.After(10 * time.Second):
-		log.Printf("等待隧道连接超时")
-		return fmt.Errorf("等待隧道连接超时")
+	case err := <-responseChan:
+		if err != nil {
+			logger.Error("客户端连接失败: %v", err)
+			// 发送失败响应
+			response := []byte{5, 1, 0, 1, 0, 0, 0, 0, 0, 0}
+			conn.Write(response)
+			return
+		}
+	case <-time.After(s.readTimeout):
+		logger.Error("等待客户端响应超时")
+		// 发送失败响应
+		response := []byte{5, 1, 0, 1, 0, 0, 0, 0, 0, 0}
+		conn.Write(response)
+		return
 	}
 
-	// 1. 握手阶段
+	// 发送成功响应
+	response := []byte{5, 0, 0, 1, 0, 0, 0, 0, 0, 0}
+	if _, err := conn.Write(response); err != nil {
+		logger.Error("发送SOCKS5响应失败: %v", err)
+		return
+	}
+
+	logger.Debug("新建连接 %d -> %s", connID, targetAddr)
+
+	// 启动数据转发
+	forwardErrChan := make(chan error, 1)
+	go func() {
+		forwardErrChan <- s.forwardData(proxyConn)
+	}()
+
+	// 等待转发结束或隧道关闭
+	select {
+	case <-s.done:
+		return
+	case err := <-forwardErrChan:
+		if err != nil && err != io.EOF {
+			logger.Error("数据转发失败: %v", err)
+		}
+	}
+}
+
+// handleSocks5Handshake 处理SOCKS5握手
+func (s *Server) handleSocks5Handshake(conn net.Conn) error {
+	// 读取版本和认证方法数量
 	buf := make([]byte, 2)
 	if _, err := io.ReadFull(conn, buf); err != nil {
-		return fmt.Errorf("读取握手头部失败: %v", err)
+		return fmt.Errorf("读取SOCKS5握手失败: %v", err)
 	}
 
-	if buf[0] != socks5Version {
-		return fmt.Errorf("不支持的 SOCKS 版本: %d", buf[0])
+	version := buf[0]
+	if version != 5 {
+		return fmt.Errorf("不支持的SOCKS版本: %d", version)
 	}
 
-	nMethods := int(buf[1])
-	methods := make([]byte, nMethods)
+	methodCount := int(buf[1])
+	methods := make([]byte, methodCount)
 	if _, err := io.ReadFull(conn, methods); err != nil {
 		return fmt.Errorf("读取认证方法失败: %v", err)
 	}
 
-	// 检查是否支持密码认证
-	var method uint8 = authPassword
-	supportPasswordAuth := false
-	for _, m := range methods {
-		if m == authPassword {
-			supportPasswordAuth = true
-			break
-		}
+	// 回复使用无认证方法
+	response := []byte{5, 0}
+	if _, err := conn.Write(response); err != nil {
+		return fmt.Errorf("发送认证响应失败: %v", err)
 	}
-
-	if !supportPasswordAuth {
-		// 如果客户端不支持密码认证，返回错误
-		conn.Write([]byte{socks5Version, 0xFF})
-		return fmt.Errorf("客户端不支持密码认证")
-	}
-
-	// 发送选择的认证方法
-	if _, err := conn.Write([]byte{socks5Version, method}); err != nil {
-		return fmt.Errorf("发送认证方法失败: %v", err)
-	}
-
-	// 2. 进行密码认证
-	if err := performPasswordAuth(conn, server); err != nil {
-		return fmt.Errorf("密码认证失败: %v", err)
-	}
-
-	// 2. 请求阶段
-	buf = server.bufferPool.Get().([]byte)
-	defer server.bufferPool.Put(buf)
-
-	if _, err := io.ReadFull(conn, buf[:4]); err != nil {
-		return fmt.Errorf("读取请求头部失败: %v", err)
-	}
-
-	// 读取地址类型
-	addrType := buf[3]
-	var totalLen int
-
-	log.Printf("SOCKS5请求: VER=%d, CMD=%d, RSV=%d, ATYP=%d",
-		buf[0], buf[1], buf[2], buf[3])
-
-	switch addrType {
-	case 1: // IPv4
-		totalLen = 4 + 2 // IPv4(4) + Port(2)
-		log.Printf("地址类型: IPv4, 需要读取长度: %d", totalLen)
-		// 读取 IPv4 地址和端口
-		if _, err := io.ReadFull(conn, buf[4:4+totalLen]); err != nil {
-			return fmt.Errorf("读取 IPv4 地址和端口失败: %v", err)
-		}
-	case 3: // Domain
-		if _, err := io.ReadFull(conn, buf[4:5]); err != nil {
-			return fmt.Errorf("读取域名长度失败: %v", err)
-		}
-		domainLen := int(buf[4])
-		if domainLen > 255 {
-			return fmt.Errorf("域名长度超出限制: %d", domainLen)
-		}
-		totalLen = 1 + domainLen + 2 // LenByte(1) + DomainLen + Port(2)
-		log.Printf("地址类型: Domain, 域名长度: %d, 总需要读取长度: %d, 域名长度字节(hex): %02x",
-			domainLen, totalLen, buf[4])
-
-		// 读取域名和端口
-		if _, err := io.ReadFull(conn, buf[5:5+domainLen+2]); err != nil {
-			return fmt.Errorf("读取域名和端口失败: %v", err)
-		}
-		domain := string(buf[5 : 5+domainLen])
-
-		port := binary.BigEndian.Uint16(buf[5+domainLen : 5+domainLen+2])
-		log.Printf("解析到域名: %s, 端口: %d", domain, port)
-	case 4: // IPv6
-		totalLen = 16 + 2 // IPv6(16) + Port(2)
-		log.Printf("地址类型: IPv6, 需要读取长度: %d", totalLen)
-		// 读取 IPv6 地址和端口
-		if _, err := io.ReadFull(conn, buf[4:4+totalLen]); err != nil {
-			return fmt.Errorf("读取 IPv6 地址和端口失败: %v", err)
-		}
-	default:
-		return fmt.Errorf("不支持的地址��型: %d", addrType)
-	}
-
-	// 打印完整的请求数据
-	log.Printf("完整的请求数据(hex): % x", buf[:4+totalLen])
-
-	// 通过隧道将连接请求发送给客户端处理
-	connID := server.generateConnID()
-
-	// 构造完整的 SOCKS5 请求消息
-	request := append([]byte{msgTypeNewConn}, make([]byte, 4)...)
-	binary.BigEndian.PutUint32(request[1:5], connID)
-	// 确保只发送实际需要的数据
-	request = append(request, buf[:4+totalLen]...)
-	log.Printf("发送到客户端的数据(hex): % x", request)
-	log.Printf("发送到客户端的完整请求数据长度: %d", len(request))
-
-	if err := server.tunnel.Write(request); err != nil {
-		return fmt.Errorf("发送隧道请求失败: %v", err)
-	}
-
-	// 发送成功响应
-	sendSocks5Response(conn, 0)
-
-	// 将当前连接存储到 activeConns 中
-	server.activeConns.Store(connID, &Connection{
-		id:         connID,
-		targetConn: conn,
-	})
-
-	// 等待连接关闭
-	<-make(chan struct{})
 
 	return nil
 }
 
-// sendSocks5Response 发送 SOCKS5 响应
-func sendSocks5Response(conn net.Conn, rep byte) error {
-	response := []byte{5, rep, 0, 1, 0, 0, 0, 0, 0, 0} // IPv4 0.0.0.0:0
-	_, err := conn.Write(response)
-	return err
-}
-
-// createTunnelConnection 通过隧道创建新的连接请求
-func (s *ProxyServer) createTunnelConnection(destAddr string, destPort uint16) (uint32, error) {
-	// 生成唯一的连接ID
-	connID := s.generateConnID()
-
-	// 组织连接请求消息
-	request := append([]byte{msgTypeNewConn}, []byte(fmt.Sprintf("%s:%d", destAddr, destPort))...)
-
-	// 通过隧道发送连接请求
-	if err := s.tunnel.Write(request); err != nil {
-		return 0, fmt.Errorf("通过隧道发送连接请求失败: %v", err)
+// handleSocks5Request 处理SOCKS5请求
+func (s *Server) handleSocks5Request(conn net.Conn) (string, error) {
+	// 读取请求头
+	header := make([]byte, 4)
+	if _, err := io.ReadFull(conn, header); err != nil {
+		return "", fmt.Errorf("读取请求头失败: %v", err)
 	}
 
-	// 存储连接
-	s.activeConns.Store(connID, &Connection{
-		id:         connID,
-		targetConn: nil, // 在隧道响应后设置
-	})
-
-	log.Printf("创建隧道连接 ID: %d, 目标: %s:%d\n", connID, destAddr, destPort)
-
-	return connID, nil
-}
-
-// handleTunnel 处理隧道连接
-func (s *ProxyServer) handleTunnel(conn net.Conn) {
-	defer conn.Close()
-
-	// 转换为 TCP 连接并设置参数
-	if tcpConn, ok := conn.(*net.TCPConn); ok {
-		tcpConn.SetKeepAlive(true)
-		tcpConn.SetKeepAlivePeriod(30 * time.Second)
-	}
-	conn.SetDeadline(time.Now().Add(5 * time.Minute))
-
-	log.Printf("新的隧道连接已建立")
-	tunnel := tunnel.NewTunnel(conn, s.encryptor)
-
-	s.mutex.Lock()
-	oldTunnel := s.tunnel
-	s.tunnel = tunnel
-	s.mutex.Unlock()
-
-	// 优雅关闭旧隧道
-	if oldTunnel != nil {
-		go func() {
-			time.Sleep(time.Second) // 等待旧连接处理完
-			oldTunnel.Close()
-		}()
+	if header[0] != 5 {
+		return "", fmt.Errorf("不支持的SOCKS版本: %d", header[0])
 	}
 
-	// 通知隧道已就绪
-	select {
-	case <-s.tunnelReady:
-		log.Printf("检测到已存在的隧道连接，关闭旧连接")
-		return
+	if header[1] != 1 {
+		return "", fmt.Errorf("不支持的命令类型: %d", header[1])
+	}
+
+	if header[2] != 0 {
+		return "", fmt.Errorf("保留字节必须为0")
+	}
+
+	// 读取地址类型
+	addrType := header[3]
+	var addr string
+	var port uint16
+
+	switch addrType {
+	case 1: // IPv4
+		buf := make([]byte, 4)
+		if _, err := io.ReadFull(conn, buf); err != nil {
+			return "", fmt.Errorf("读取IPv4地址失败: %v", err)
+		}
+		addr = net.IP(buf).String()
+
+	case 3: // 域名
+		buf := make([]byte, 1)
+		if _, err := io.ReadFull(conn, buf); err != nil {
+			return "", fmt.Errorf("读取域名长度失败: %v", err)
+		}
+		domainLen := int(buf[0])
+
+		domain := make([]byte, domainLen)
+		if _, err := io.ReadFull(conn, domain); err != nil {
+			return "", fmt.Errorf("读取域名失败: %v", err)
+		}
+		addr = string(domain)
+
+	case 4: // IPv6
+		buf := make([]byte, 16)
+		if _, err := io.ReadFull(conn, buf); err != nil {
+			return "", fmt.Errorf("读取IPv6地址失败: %v", err)
+		}
+		addr = net.IP(buf).String()
+
 	default:
-		log.Printf("标记隧道为就绪状态")
-		close(s.tunnelReady)
+		return "", fmt.Errorf("不支持的地址类型: %d", addrType)
 	}
 
-	// 当隧道连接断开时，重置 tunnelReady 通道
-	defer func() {
-		s.mutex.Lock()
-		s.tunnel = nil
-		s.tunnelReady = make(chan struct{})
-		s.mutex.Unlock()
-		// 清理所有活跃连接
-		s.activeConns.Range(func(key, value interface{}) bool {
-			if conn, ok := value.(*Connection); ok && conn.targetConn != nil {
-				conn.targetConn.Close()
-			}
-			s.activeConns.Delete(key)
-			return true
-		})
-	}()
-
-	for {
-		data, err := tunnel.Read()
-		if err != nil {
-			log.Printf("隧道读取数据错误: %v\n", err)
-			return
-		}
-
-		if len(data) == 0 {
-			continue
-		}
-
-		switch data[0] {
-		case msgTypeData:
-			if len(data) < 5 {
-				continue
-			}
-			connID := binary.BigEndian.Uint32(data[1:5])
-			payload := data[5:]
-
-			if conn, ok := s.activeConns.Load(connID); ok {
-				activeConn := conn.(*Connection)
-				if activeConn.targetConn != nil {
-					// 使用带缓冲的写入
-					select {
-					case <-time.After(time.Second):
-						log.Printf("[连接 %d] 写入超时", connID)
-						s.cleanupConnection(connID)
-					default:
-						if _, err := activeConn.targetConn.Write(payload); err != nil {
-							log.Printf("[连接 %d] 写入目标服务数据错误: %v\n", connID, err)
-							s.cleanupConnection(connID)
-						}
-					}
-				}
-			}
-
-		case msgTypeNewConn:
-			// 处理客户端通过隧道发送的新连接响应
-			if len(data) < 5 {
-				log.Printf("无效的新连接响应: 数据太短\n")
-				continue
-			}
-			connID := binary.BigEndian.Uint32(data[1:5])
-			log.Printf("收到新连接响应，连接ID: %d\n", connID)
-
-			if conn, ok := s.activeConns.Load(connID); ok {
-				activeConn := conn.(*Connection)
-				if activeConn.targetConn != nil {
-					// 启动数据转发
-					go func() {
-						defer func() {
-							s.activeConns.Delete(connID)
-							activeConn.targetConn.Close()
-						}()
-
-						buf := s.bufferPool.Get().([]byte)
-						defer s.bufferPool.Put(buf)
-
-						for {
-							s.mutex.RLock()
-							currentTunnel := s.tunnel
-							s.mutex.RUnlock()
-
-							if currentTunnel == nil {
-								log.Printf("[连接 %d] 隧道已断开\n", connID)
-								return
-							}
-
-							n, err := activeConn.targetConn.Read(buf)
-							if err != nil {
-								log.Printf("[连接 %d] 读取SOCKS5连接数据错误: %v\n", connID, err)
-								return
-							}
-
-							// 构造数据消息
-							message := append([]byte{msgTypeData}, make([]byte, 4)...)
-							binary.BigEndian.PutUint32(message[1:5], connID)
-							message = append(message, buf[:n]...)
-
-							if err := currentTunnel.Write(message); err != nil {
-								log.Printf("[连接 %d] 发送数据到隧道错误: %v\n", connID, err)
-								return
-							}
-						}
-					}()
-				}
-			}
-
-		default:
-			log.Printf("未知的消息类型: %d\n", data[0])
-		}
-	}
-}
-
-// 添加一个新的方法来理连接
-func (s *ProxyServer) cleanupConnection(connID uint32) {
-	if conn, ok := s.activeConns.Load(connID); ok {
-		activeConn := conn.(*Connection)
-		if activeConn.targetConn != nil {
-			activeConn.targetConn.Close()
-		}
-		s.activeConns.Delete(connID)
-		log.Printf("[连接 %d] 已清理\n", connID)
-	}
-}
-
-// 添加一个方法来检查隧道是否就绪
-func (s *ProxyServer) isTunnelReady() bool {
-	select {
-	case <-s.tunnelReady:
-		return true
-	default:
-		return false
-	}
-}
-
-// 添加新的数据转发方法
-func (s *ProxyServer) forwardData(src, dst net.Conn, connID uint32) {
-	buf := s.bufferPool.Get().([]byte)
-	defer s.bufferPool.Put(buf)
-
-	for {
-		// 使用配置的超时参数
-		src.SetReadDeadline(time.Now().Add(s.readTimeout))
-
-		n, err := src.Read(buf)
-		if err != nil {
-			if err != io.EOF {
-				log.Printf("[连接 %d] 读取数据错误: %v", connID, err)
-			}
-			return
-		}
-
-		// 设置写入超时
-		dst.SetWriteDeadline(time.Now().Add(s.writeTimeout))
-
-		if _, err := dst.Write(buf[:n]); err != nil {
-			log.Printf("[连接 %d] 写入数据错误: %v", connID, err)
-			return
-		}
-	}
-}
-
-// 添加健康检查方法
-func (s *ProxyServer) startHealthCheck() {
-	ticker := time.NewTicker(30 * time.Second)
-	go func() {
-		for range ticker.C {
-			s.activeConns.Range(func(key, value interface{}) bool {
-				conn := value.(*Connection)
-				if conn.lastActive.Add(5 * time.Minute).Before(time.Now()) {
-					s.cleanupConnection(conn.id)
-				}
-				return true
-			})
-		}
-	}()
-}
-
-// 添加验证用户凭证的方法
-func (s *ProxyServer) validateCredentials(username, password string) bool {
-	if storedPass, exists := s.credentials[username]; exists {
-		return storedPass == password
-	}
-	return false
-}
-
-// 添加密码认证处理��数
-func performPasswordAuth(conn net.Conn, server *ProxyServer) error {
-	// 读取认证消息
+	// 读取端口
 	buf := make([]byte, 2)
 	if _, err := io.ReadFull(conn, buf); err != nil {
-		return err
+		return "", fmt.Errorf("读取端口失败: %v", err)
+	}
+	port = binary.BigEndian.Uint16(buf)
+
+	// 返回目标地址，但不发送响应
+	// 响应会在连接成功后发送
+	return fmt.Sprintf("%s:%d", addr, port), nil
+}
+
+// heartbeat 发送心跳包
+func (s *Server) heartbeat() {
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-s.done:
+			return
+		case <-ticker.C:
+			if s.tunnel == nil {
+				continue
+			}
+
+			// 发送心跳包
+			heartbeat := []byte{0} // 0表示心跳包
+			if err := s.tunnel.Write(heartbeat); err != nil {
+				logger.Error("发送心跳包失败: %v", err)
+				return
+			}
+		}
+	}
+}
+
+// handleTunnelMessages 处理隧道消息
+func (s *Server) handleTunnelMessages() {
+	for {
+		select {
+		case <-s.done:
+			return
+		default:
+			if s.tunnel == nil {
+				time.Sleep(100 * time.Millisecond)
+				continue
+			}
+
+			// 读取消息
+			data, err := s.tunnel.Read()
+			if err != nil {
+				logger.Error("读取隧道消息失败: %v", err)
+				s.tunnel = nil
+				return
+			}
+
+			if len(data) == 0 {
+				continue
+			}
+
+			// 处理消息
+			switch data[0] {
+			case 0: // 心跳包
+				continue
+			case 1: // 新连接响应
+				if err := s.handleConnectionResponse(data[1:]); err != nil {
+					logger.Error("处理连接响应失败: %v", err)
+				}
+			case 2: // 数据转发
+				if err := s.handleData(data[1:]); err != nil {
+					logger.Error("处理数据转发失败: %v", err)
+				}
+			default:
+				logger.Error("未知消息类型: %d", data[0])
+			}
+		}
+	}
+}
+
+// handleConnectionResponse 处理连接响应
+func (s *Server) handleConnectionResponse(data []byte) error {
+	if len(data) < 4 {
+		return fmt.Errorf("连接响应数据长度不足")
 	}
 
-	if buf[0] != 1 { // 版本号必须是 1
-		return fmt.Errorf("不支持的认证协议版本: %d", buf[0])
+	// 解析连接ID
+	connID := binary.BigEndian.Uint32(data[:4])
+
+	// 获取响应通道
+	respChanInterface, ok := s.activeConns.Load(fmt.Sprintf("resp_%d", connID))
+	if !ok {
+		return fmt.Errorf("未找到连接响应通道: %d", connID)
 	}
 
-	// 读取用户名
-	userLen := int(buf[1])
-	username := make([]byte, userLen)
-	if _, err := io.ReadFull(conn, username); err != nil {
-		return err
+	// 获取连接
+	connInterface, ok := s.activeConns.Load(connID)
+	if !ok {
+		respChan := respChanInterface.(chan error)
+		respChan <- fmt.Errorf("未找到连接: %d", connID)
+		return fmt.Errorf("未找到连接: %d", connID)
 	}
 
-	// 读取密码
-	buf = make([]byte, 1)
-	if _, err := io.ReadFull(conn, buf); err != nil {
-		return err
-	}
-	passLen := int(buf[0])
-	password := make([]byte, passLen)
-	if _, err := io.ReadFull(conn, password); err != nil {
-		return err
+	conn := connInterface.(*connection)
+	conn.lastActive = time.Now()
+
+	// 发送响应
+	respChan := respChanInterface.(chan error)
+	respChan <- nil
+
+	return nil
+}
+
+// handleData 处理数据转发
+func (s *Server) handleData(data []byte) error {
+	if len(data) < 4 {
+		return fmt.Errorf("数据长度不足")
 	}
 
-	// 验证凭证
-	if !server.validateCredentials(string(username), string(password)) {
-		// 认证失败
-		conn.Write([]byte{1, 1}) // 版本号1，状态1表示失败
-		return fmt.Errorf("认证失败")
+	// 解析连接ID
+	connID := binary.BigEndian.Uint32(data[:4])
+	payload := data[4:]
+
+	// 获取连接
+	connInterface, ok := s.activeConns.Load(connID)
+	if !ok {
+		return fmt.Errorf("未找到连接: %d", connID)
 	}
 
-	// 认证成功
-	_, err := conn.Write([]byte{1, 0}) // 版本号1，状态0表示成功
-	return err
+	conn := connInterface.(*connection)
+	conn.lastActive = time.Now()
+
+	// 发送数据到本地连接
+	if _, err := conn.localConn.Write(payload); err != nil {
+		s.cleanupConnection(connID)
+		return fmt.Errorf("发送数据到本地连接失败: %v", err)
+	}
+
+	return nil
+}
+
+// forwardData 转发本地连接的数据到隧道
+func (s *Server) forwardData(conn *connection) error {
+	buffer := make([]byte, 32*1024)
+	for {
+		select {
+		case <-s.done:
+			return nil
+		default:
+			// 读取本地连接数据
+			n, err := conn.localConn.Read(buffer)
+			if err != nil {
+				if err == io.EOF {
+					return err
+				}
+				if ne, ok := err.(net.Error); ok && ne.Temporary() {
+					time.Sleep(100 * time.Millisecond)
+					continue
+				}
+				return fmt.Errorf("读取本地连接数据失败: %v", err)
+			}
+
+			// 准备转发数据
+			data := make([]byte, n+5)
+			data[0] = 2 // 数据转发
+			binary.BigEndian.PutUint32(data[1:5], conn.id)
+			copy(data[5:], buffer[:n])
+
+			// 发送数据到隧道
+			if err := s.tunnel.Write(data); err != nil {
+				return fmt.Errorf("发送数据到隧道失败: %v", err)
+			}
+
+			conn.lastActive = time.Now()
+		}
+	}
+}
+
+// cleanupConnection 清理连接
+func (s *Server) cleanupConnection(connID uint32) {
+	if conn, ok := s.activeConns.Load(connID); ok {
+		activeConn := conn.(*connection)
+		activeConn.localConn.Close()
+		s.activeConns.Delete(connID)
+		logger.Debug("清理连接 %d", connID)
+	}
+}
+
+// Close 关闭服务器
+func (s *Server) Close() error {
+	close(s.done)
+
+	// 关闭所有活跃连接
+	s.activeConns.Range(func(key, value interface{}) bool {
+		conn := value.(*connection)
+		conn.localConn.Close()
+		return true
+	})
+
+	// 关闭隧道
+	if s.tunnel != nil {
+		return s.tunnel.Close()
+	}
+
+	return nil
 }

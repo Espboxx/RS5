@@ -8,63 +8,78 @@ import (
 	"io"
 )
 
+// Encryptor 定义了加密器接口
 type Encryptor interface {
 	Encrypt([]byte) ([]byte, error)
 	Decrypt([]byte) ([]byte, error)
 }
 
+// AESEncryptor AES加密器实现
 type AESEncryptor struct {
-	key []byte
+	block cipher.Block
 }
 
-func NewAESEncryptor(key []byte) (*AESEncryptor, error) {
-	if len(key) != 32 {
-		key = padKey(key, 32)
+// NewAESEncryptor 创建新的AES加密器
+func NewAESEncryptor(key []byte) (Encryptor, error) {
+	// 确保密钥长度为32字节
+	if len(key) > 32 {
+		key = key[:32]
+	} else if len(key) < 32 {
+		newKey := make([]byte, 32)
+		copy(newKey, key)
+		for i := len(key); i < 32; i++ {
+			newKey[i] = byte(i)
+		}
+		key = newKey
 	}
-	return &AESEncryptor{key: key}, nil
+
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, fmt.Errorf("创建AES加密器失败: %v", err)
+	}
+
+	return &AESEncryptor{block: block}, nil
 }
 
-func padKey(key []byte, size int) []byte {
-	padded := make([]byte, size)
-	copy(padded, key)
-	return padded
+// Encrypt 加密数据
+func (e *AESEncryptor) Encrypt(data []byte) ([]byte, error) {
+	// 创建随机IV
+	iv := make([]byte, aes.BlockSize)
+	if _, err := io.ReadFull(rand.Reader, iv); err != nil {
+		return nil, fmt.Errorf("生成IV失败: %v", err)
+	}
+
+	// 创建加密器
+	stream := cipher.NewCFBEncrypter(e.block, iv)
+
+	// 加密数据
+	encrypted := make([]byte, len(data))
+	stream.XORKeyStream(encrypted, data)
+
+	// 返回IV+加密数据
+	result := make([]byte, len(iv)+len(encrypted))
+	copy(result, iv)
+	copy(result[len(iv):], encrypted)
+
+	return result, nil
 }
 
-func (a *AESEncryptor) Encrypt(plaintext []byte) ([]byte, error) {
-	block, err := aes.NewCipher(a.key)
-	if err != nil {
-		return nil, err
+// Decrypt 解密数据
+func (e *AESEncryptor) Decrypt(data []byte) ([]byte, error) {
+	if len(data) < aes.BlockSize {
+		return nil, fmt.Errorf("数据长度不足")
 	}
 
-	gcm, err := cipher.NewGCM(block)
-	if err != nil {
-		return nil, err
-	}
+	// 提取IV
+	iv := data[:aes.BlockSize]
+	data = data[aes.BlockSize:]
 
-	nonce := make([]byte, gcm.NonceSize())
-	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
-		return nil, err
-	}
+	// 创建解密器
+	stream := cipher.NewCFBDecrypter(e.block, iv)
 
-	return gcm.Seal(nonce, nonce, plaintext, nil), nil
-}
+	// 解密数据
+	decrypted := make([]byte, len(data))
+	stream.XORKeyStream(decrypted, data)
 
-func (a *AESEncryptor) Decrypt(ciphertext []byte) ([]byte, error) {
-	block, err := aes.NewCipher(a.key)
-	if err != nil {
-		return nil, err
-	}
-
-	gcm, err := cipher.NewGCM(block)
-	if err != nil {
-		return nil, err
-	}
-
-	nonceSize := gcm.NonceSize()
-	if len(ciphertext) < nonceSize {
-		return nil, fmt.Errorf("ciphertext too short")
-	}
-
-	nonce, ciphertext := ciphertext[:nonceSize], ciphertext[nonceSize:]
-	return gcm.Open(nil, nonce, ciphertext, nil)
+	return decrypted, nil
 }
