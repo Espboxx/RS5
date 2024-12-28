@@ -59,7 +59,7 @@ type ProxyServer struct {
 	socksPort    int            // SOCKS5代理端口
 	tunnelPort   int            // 隧道端口
 	tunnel       *tunnel.Tunnel // 控制隧道连接
-	nextConnID   uint32         // 下一个可用的连接ID
+	nextConnID   uint32         // 下一用的连接ID
 	mutex        sync.RWMutex
 	encryptor    crypto.Encryptor
 	activeConns  sync.Map      // 活跃的连接映射，key为connID
@@ -67,6 +67,10 @@ type ProxyServer struct {
 	bufferPool   sync.Pool
 	maxConns     int
 	currentConns int32
+	// 连接参数
+	keepAliveInterval time.Duration
+	readTimeout       time.Duration
+	writeTimeout      time.Duration
 }
 
 func RunServer(cmd *cobra.Command, args []string) {
@@ -101,7 +105,10 @@ func RunServer(cmd *cobra.Command, args []string) {
 				return make([]byte, 32*1024) // 32KB 缓冲区
 			},
 		},
-		maxConns: 1000, // 最大并发连接数
+		maxConns:          1000, // 最大并发连接数
+		keepAliveInterval: 30 * time.Second,
+		readTimeout:       2 * time.Minute,
+		writeTimeout:      30 * time.Second,
 	}
 
 	// 启动 SOCKS5 服务
@@ -166,7 +173,12 @@ func handleSocks5(conn net.Conn, server *ProxyServer) error {
 	atomic.AddInt32(&server.currentConns, 1)
 	defer atomic.AddInt32(&server.currentConns, -1)
 
-	// 设置连接超时
+	// 设置 TCP 连接参数
+	if tcpConn, ok := conn.(*net.TCPConn); ok {
+		tcpConn.SetKeepAlive(true)
+		tcpConn.SetKeepAlivePeriod(30 * time.Second)
+		tcpConn.SetNoDelay(true) // 禁用 Nagle 算法，减少延迟
+	}
 	conn.SetDeadline(time.Now().Add(5 * time.Minute))
 
 	// 等待隧道就绪
@@ -266,7 +278,7 @@ func handleSocks5(conn net.Conn, server *ProxyServer) error {
 	// 确保只发送实际需要的数据
 	request = append(request, buf[:4+totalLen]...)
 	log.Printf("发送到客户端的数据(hex): % x", request)
-	log.Printf("发送到客户端的完整请求数据长度: %d", len(request))
+	log.Printf("发送到客户端的完��请求数据长度: %d", len(request))
 
 	if err := server.tunnel.Write(request); err != nil {
 		return fmt.Errorf("发送隧道请求失败: %v", err)
@@ -322,9 +334,11 @@ func (s *ProxyServer) createTunnelConnection(destAddr string, destPort uint16) (
 func (s *ProxyServer) handleTunnel(conn net.Conn) {
 	defer conn.Close()
 
-	// 设置连接超时
-	conn.SetKeepAlive(true)
-	conn.SetKeepAlivePeriod(30 * time.Second)
+	// 转换为 TCP 连接并设置参数
+	if tcpConn, ok := conn.(*net.TCPConn); ok {
+		tcpConn.SetKeepAlive(true)
+		tcpConn.SetKeepAlivePeriod(30 * time.Second)
+	}
 	conn.SetDeadline(time.Now().Add(5 * time.Minute))
 
 	log.Printf("新的隧道连接已建立")
@@ -463,7 +477,7 @@ func (s *ProxyServer) handleTunnel(conn net.Conn) {
 	}
 }
 
-// 添加一个新的方法来��理连接
+// 添加一个新的方法来理连接
 func (s *ProxyServer) cleanupConnection(connID uint32) {
 	if conn, ok := s.activeConns.Load(connID); ok {
 		activeConn := conn.(*Connection)
@@ -491,8 +505,8 @@ func (s *ProxyServer) forwardData(src, dst net.Conn, connID uint32) {
 	defer s.bufferPool.Put(buf)
 
 	for {
-		// 设置读取超时
-		src.SetReadDeadline(time.Now().Add(2 * time.Minute))
+		// 使用配置的超时参数
+		src.SetReadDeadline(time.Now().Add(s.readTimeout))
 
 		n, err := src.Read(buf)
 		if err != nil {
@@ -503,7 +517,7 @@ func (s *ProxyServer) forwardData(src, dst net.Conn, connID uint32) {
 		}
 
 		// 设置写入超时
-		dst.SetWriteDeadline(time.Now().Add(30 * time.Second))
+		dst.SetWriteDeadline(time.Now().Add(s.writeTimeout))
 
 		if _, err := dst.Write(buf[:n]); err != nil {
 			log.Printf("[连接 %d] 写入数据错误: %v", connID, err)

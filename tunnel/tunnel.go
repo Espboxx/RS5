@@ -51,3 +51,7 @@ func (t *Tunnel) Read() ([]byte, error) {
 
 	return t.encryptor.Decrypt(encrypted)
 }
+
+func (t *Tunnel) Close() error {
+	return t.conn.Close()
+}
