@@ -14,6 +14,8 @@ var (
 	serverSocksPort  int
 	serverTunnelPort int
 	serverKey        string
+	serverUsername   string
+	serverPassword   string
 )
 
 // 客户端参数
@@ -47,6 +49,8 @@ func main() {
 	serverCmd.Flags().IntVarP(&serverSocksPort, "socks", "p", 1080, "SOCKS5代理端口")
 	serverCmd.Flags().IntVarP(&serverTunnelPort, "tunnel", "u", 7000, "隧道端口")
 	serverCmd.Flags().StringVarP(&serverKey, "key", "k", "default-key", "加密密钥")
+	serverCmd.Flags().StringVarP(&serverUsername, "username", "U", "user1", "SOCKS5认证用户名")
+	serverCmd.Flags().StringVarP(&serverPassword, "password", "P", "pass1", "SOCKS5认证密码")
 
 	// 客户端参数
 	clientCmd.Flags().StringVarP(&clientServerHost, "server", "c", "localhost", "服务器地址")

@@ -20,7 +20,8 @@ const (
 	socks5Version = uint8(5)
 
 	// 认证方法
-	authNone = uint8(0)
+	authNone     = uint8(0)
+	authPassword = uint8(2)
 
 	// 命令类型
 	cmdConnect = uint8(1)
@@ -71,6 +72,7 @@ type ProxyServer struct {
 	keepAliveInterval time.Duration
 	readTimeout       time.Duration
 	writeTimeout      time.Duration
+	credentials       map[string]string // 用户名和密码映射
 }
 
 func RunServer(cmd *cobra.Command, args []string) {
@@ -87,8 +89,17 @@ func RunServer(cmd *cobra.Command, args []string) {
 	if err != nil {
 		log.Fatal(err)
 	}
+	username, err := cmd.Flags().GetString("username")
+	if err != nil {
+		log.Fatal(err)
+	}
+	password, err := cmd.Flags().GetString("password")
+	if err != nil {
+		log.Fatal(err)
+	}
 
-	log.Printf("socksPort: %d, tunnelPort: %d, key: %s", socksPort, tunnelPort, key)
+	log.Printf("socksPort: %d, tunnelPort: %d, key: %s, username: %s",
+		socksPort, tunnelPort, key, username)
 
 	encryptor, err := crypto.NewAESEncryptor([]byte(key))
 	if err != nil {
@@ -109,6 +120,9 @@ func RunServer(cmd *cobra.Command, args []string) {
 		keepAliveInterval: 30 * time.Second,
 		readTimeout:       2 * time.Minute,
 		writeTimeout:      30 * time.Second,
+		credentials: map[string]string{
+			username: password, // 使用命令行参数设置认证信息
+		},
 	}
 
 	// 启动 SOCKS5 服务
@@ -197,7 +211,7 @@ func handleSocks5(conn net.Conn, server *ProxyServer) error {
 		return fmt.Errorf("读取握手头部失败: %v", err)
 	}
 
-	if buf[0] != 5 {
+	if buf[0] != socks5Version {
 		return fmt.Errorf("不支持的 SOCKS 版本: %d", buf[0])
 	}
 
@@ -207,9 +221,30 @@ func handleSocks5(conn net.Conn, server *ProxyServer) error {
 		return fmt.Errorf("读取认证方法失败: %v", err)
 	}
 
-	// 选择不认证
-	if _, err := conn.Write([]byte{5, 0}); err != nil {
-		return fmt.Errorf("写入认证方法响应失败: %v", err)
+	// 检查是否支持密码认证
+	var method uint8 = authPassword
+	supportPasswordAuth := false
+	for _, m := range methods {
+		if m == authPassword {
+			supportPasswordAuth = true
+			break
+		}
+	}
+
+	if !supportPasswordAuth {
+		// 如果客户端不支持密码认证，返回错误
+		conn.Write([]byte{socks5Version, 0xFF})
+		return fmt.Errorf("客户端不支持密码认证")
+	}
+
+	// 发送选择的认证方法
+	if _, err := conn.Write([]byte{socks5Version, method}); err != nil {
+		return fmt.Errorf("发送认证方法失败: %v", err)
+	}
+
+	// 2. 进行密码认证
+	if err := performPasswordAuth(conn, server); err != nil {
+		return fmt.Errorf("密码认证失败: %v", err)
 	}
 
 	// 2. 请求阶段
@@ -263,7 +298,7 @@ func handleSocks5(conn net.Conn, server *ProxyServer) error {
 			return fmt.Errorf("读取 IPv6 地址和端口失败: %v", err)
 		}
 	default:
-		return fmt.Errorf("不支持的地址类型: %d", addrType)
+		return fmt.Errorf("不支持的地址��型: %d", addrType)
 	}
 
 	// 打印完整的请求数据
@@ -278,7 +313,7 @@ func handleSocks5(conn net.Conn, server *ProxyServer) error {
 	// 确保只发送实际需要的数据
 	request = append(request, buf[:4+totalLen]...)
 	log.Printf("发送到客户端的数据(hex): % x", request)
-	log.Printf("发送到客户端的完��请求数据长度: %d", len(request))
+	log.Printf("发送到客户端的完整请求数据长度: %d", len(request))
 
 	if err := server.tunnel.Write(request); err != nil {
 		return fmt.Errorf("发送隧道请求失败: %v", err)
@@ -540,4 +575,54 @@ func (s *ProxyServer) startHealthCheck() {
 			})
 		}
 	}()
+}
+
+// 添加验证用户凭证的方法
+func (s *ProxyServer) validateCredentials(username, password string) bool {
+	if storedPass, exists := s.credentials[username]; exists {
+		return storedPass == password
+	}
+	return false
+}
+
+// 添加密码认证处理��数
+func performPasswordAuth(conn net.Conn, server *ProxyServer) error {
+	// 读取认证消息
+	buf := make([]byte, 2)
+	if _, err := io.ReadFull(conn, buf); err != nil {
+		return err
+	}
+
+	if buf[0] != 1 { // 版本号必须是 1
+		return fmt.Errorf("不支持的认证协议版本: %d", buf[0])
+	}
+
+	// 读取用户名
+	userLen := int(buf[1])
+	username := make([]byte, userLen)
+	if _, err := io.ReadFull(conn, username); err != nil {
+		return err
+	}
+
+	// 读取密码
+	buf = make([]byte, 1)
+	if _, err := io.ReadFull(conn, buf); err != nil {
+		return err
+	}
+	passLen := int(buf[0])
+	password := make([]byte, passLen)
+	if _, err := io.ReadFull(conn, password); err != nil {
+		return err
+	}
+
+	// 验证凭证
+	if !server.validateCredentials(string(username), string(password)) {
+		// 认证失败
+		conn.Write([]byte{1, 1}) // 版本号1，状态1表示失败
+		return fmt.Errorf("认证失败")
+	}
+
+	// 认证成功
+	_, err := conn.Write([]byte{1, 0}) // 版本号1，状态0表示成功
+	return err
 }
