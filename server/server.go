@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -36,6 +37,8 @@ type Server struct {
 	nextConnID   uint32
 	readTimeout  time.Duration
 	writeTimeout time.Duration
+	udpAddr      string
+	udpConn      *net.UDPConn
 }
 
 // NewServer 创建新的服务器
@@ -277,16 +280,97 @@ func (s *Server) handleSocks5Request(conn net.Conn) (string, error) {
 		return "", fmt.Errorf("不支持的SOCKS版本: %d", header[0])
 	}
 
-	if header[1] != 1 {
-		return "", fmt.Errorf("不支持的命令类型: %d", header[1])
-	}
-
 	if header[2] != 0 {
 		return "", fmt.Errorf("保留字节必须为0")
 	}
 
-	// 读取地址类型
-	addrType := header[3]
+	// 根据命令类型处理
+	switch header[1] {
+	case 1: // CONNECT
+		return s.handleConnect(conn, header[3])
+	case 3: // UDP ASSOCIATE
+		return s.handleUDPAssociate(conn, header[3])
+	default:
+		return "", fmt.Errorf("不支持的命令类型: %d", header[1])
+	}
+}
+
+// handleConnect 处理TCP CONNECT请求
+func (s *Server) handleConnect(conn net.Conn, addrType byte) (string, error) {
+	// 读取地址和端口
+	return s.readAddress(conn, addrType)
+}
+
+// handleUDPAssociate 处理UDP ASSOCIATE请求
+func (s *Server) handleUDPAssociate(conn net.Conn, addrType byte) (string, error) {
+	// 读取客户端地址(这个地址在UDP转发中不使用)
+	clientAddr, err := s.readAddress(conn, addrType)
+	if err != nil {
+		return "", err
+	}
+
+	// 如果UDP监听器还未创建，创建一个
+	if s.udpConn == nil {
+		// 解析代理地址获取IP
+		host, _, err := net.SplitHostPort(s.proxyAddr)
+		if err != nil {
+			return "", fmt.Errorf("解析代理地址失败: %v", err)
+		}
+
+		// 在随机端口上创建UDP监听器
+		addr, err := net.ResolveUDPAddr("udp", host+":0")
+		if err != nil {
+			return "", fmt.Errorf("解析UDP地址失败: %v", err)
+		}
+
+		udpConn, err := net.ListenUDP("udp", addr)
+		if err != nil {
+			return "", fmt.Errorf("创建UDP监听失败: %v", err)
+		}
+
+		s.udpConn = udpConn
+		s.udpAddr = udpConn.LocalAddr().String()
+
+		// 启动UDP处理协程
+		go s.handleUDP()
+	}
+
+	logger.Debug("UDP ASSOCIATE 请求来自 %s, 分配UDP端口: %s", clientAddr, s.udpAddr)
+
+	// 返回UDP监听地址
+	host, port, err := net.SplitHostPort(s.udpAddr)
+	if err != nil {
+		return "", fmt.Errorf("解析UDP地址失败: %v", err)
+	}
+
+	portNum, err := strconv.Atoi(port)
+	if err != nil {
+		return "", fmt.Errorf("解析端口失败: %v", err)
+	}
+
+	// 发送响应
+	response := make([]byte, 10)
+	response[0] = 5 // VER
+	response[1] = 0 // SUCCESS
+	response[2] = 0 // RSV
+	response[3] = 1 // IPv4
+
+	// 写入IP地址
+	ip := net.ParseIP(host).To4()
+	copy(response[4:8], ip)
+
+	// 写入端口
+	binary.BigEndian.PutUint16(response[8:], uint16(portNum))
+
+	if _, err := conn.Write(response); err != nil {
+		return "", fmt.Errorf("发送UDP响应失败: %v", err)
+	}
+
+	return clientAddr, nil
+}
+
+// readAddress 读取SOCKS5地址
+func (s *Server) readAddress(conn net.Conn, addrType byte) (string, error) {
 	var addr string
 	var port uint16
 
@@ -329,9 +413,101 @@ func (s *Server) handleSocks5Request(conn net.Conn) (string, error) {
 	}
 	port = binary.BigEndian.Uint16(buf)
 
-	// 返回目标地址，但不发送响应
-	// 响应会在连接成功后发送
 	return fmt.Sprintf("%s:%d", addr, port), nil
+}
+
+// handleUDP 处理UDP数据包
+func (s *Server) handleUDP() {
+	defer s.udpConn.Close()
+
+	buffer := make([]byte, 64*1024)
+	for {
+		select {
+		case <-s.done:
+			return
+		default:
+			n, remoteAddr, err := s.udpConn.ReadFromUDP(buffer)
+			if err != nil {
+				logger.Error("读取UDP数据失败: %v", err)
+				continue
+			}
+
+			// 解析SOCKS5 UDP请求头
+			if n < 10 { // 最小UDP请求头长度
+				continue
+			}
+
+			// SOCKS5 UDP请求头格式:
+			// +----+------+------+----------+----------+----------+
+			// |RSV | FRAG | ATYP | DST.ADDR | DST.PORT |   DATA  |
+			// +----+------+------+----------+----------+----------+
+			// | 2  |  1   |  1   | Variable |    2     | Variable|
+			// +----+------+------+----------+----------+----------+
+
+			frag := buffer[2] // 分片号
+			if frag != 0 {
+				// 暂不支持分片
+				continue
+			}
+
+			addrType := buffer[3]
+			var headerLen int
+			var targetAddr string
+
+			switch addrType {
+			case 1: // IPv4
+				if n < 10 {
+					continue
+				}
+				ip := net.IP(buffer[4:8])
+				port := binary.BigEndian.Uint16(buffer[8:10])
+				targetAddr = fmt.Sprintf("%s:%d", ip.String(), port)
+				headerLen = 10
+			case 3: // 域名
+				if n < 5 {
+					continue
+				}
+				domainLen := int(buffer[4])
+				if n < 5+domainLen+2 {
+					continue
+				}
+				domain := string(buffer[5 : 5+domainLen])
+				port := binary.BigEndian.Uint16(buffer[5+domainLen : 7+domainLen])
+				targetAddr = fmt.Sprintf("%s:%d", domain, port)
+				headerLen = 7 + domainLen
+			case 4: // IPv6
+				if n < 22 {
+					continue
+				}
+				ip := net.IP(buffer[4:20])
+				port := binary.BigEndian.Uint16(buffer[20:22])
+				targetAddr = fmt.Sprintf("[%s]:%d", ip.String(), port)
+				headerLen = 22
+			default:
+				continue
+			}
+
+			// 生成连接ID
+			connID := atomic.AddUint32(&s.nextConnID, 1)
+
+			// 准备转发数据
+			data := make([]byte, n-headerLen+9)
+			data[0] = 3 // UDP数据包
+			binary.BigEndian.PutUint32(data[1:5], connID)
+			// 写入源地址
+			copy(data[5:], []byte(remoteAddr.String()))
+			// 写入目标地址
+			copy(data[5+len(remoteAddr.String()):], buffer[headerLen:n])
+
+			// 发送到隧道
+			if err := s.tunnel.Write(data); err != nil {
+				logger.Error("发送UDP数据到隧道失败: %v", err)
+				continue
+			}
+
+			logger.Debug("转发UDP数据包 %d -> %s", connID, targetAddr)
+		}
+	}
 }
 
 // heartbeat 发送心跳包
@@ -519,6 +695,11 @@ func (s *Server) Close() error {
 		conn.localConn.Close()
 		return true
 	})
+
+	// 关闭UDP监听器
+	if s.udpConn != nil {
+		s.udpConn.Close()
+	}
 
 	// 关闭隧道
 	if s.tunnel != nil {

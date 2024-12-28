@@ -34,6 +34,7 @@ type Client struct {
 	nextConnID   uint32
 	readTimeout  time.Duration
 	writeTimeout time.Duration
+	udpConns     sync.Map
 }
 
 // NewClient 创建新的客户端
@@ -76,7 +77,7 @@ func (c *Client) Start() error {
 		if err := kcpConn.SetWriteBuffer(4194304); err != nil {
 			logger.Warn("设置KCP写缓冲区失败: %v", err)
 		}
-		// 应用KCP配置
+		// 应用KCP���置
 		tunnel.ApplyKCPConfig(kcpConn, c.kcpConfig)
 		logger.Debug("已应用KCP配置: MTU=%d, 窗口大小=%d/%d",
 			c.kcpConfig.MTU, c.kcpConfig.SndWnd, c.kcpConfig.RcvWnd)
@@ -159,6 +160,10 @@ func (c *Client) handleTunnelMessages() {
 			case 2: // 数据转发
 				if err := c.handleData(data[1:]); err != nil {
 					logger.Error("处理数据转发失败: %v", err)
+				}
+			case 3: // UDP数据包
+				if err := c.handleUDPData(data[1:]); err != nil {
+					logger.Error("处理UDP数据失败: %v", err)
 				}
 			default:
 				logger.Error("未知消息类型: %d", data[0])
@@ -287,6 +292,116 @@ func (c *Client) cleanupConnection(connID uint32) {
 	}
 }
 
+// udpConn UDP连接结构体
+type udpConn struct {
+	conn       *net.UDPConn
+	targetAddr *net.UDPAddr
+	sourceAddr *net.UDPAddr
+	lastActive time.Time
+}
+
+// handleUDPData 处理UDP数据
+func (c *Client) handleUDPData(data []byte) error {
+	if len(data) < 9 { // 至少需要4字节连接ID和5字节源地址
+		return fmt.Errorf("UDP数据长度不足")
+	}
+
+	// 解析连接ID
+	connID := binary.BigEndian.Uint32(data[:4])
+
+	// 解析源地址
+	sourceAddrStr := string(data[4:9])
+	sourceAddr, err := net.ResolveUDPAddr("udp", sourceAddrStr)
+	if err != nil {
+		return fmt.Errorf("解析源地址失败: %v", err)
+	}
+
+	// 获取或创建UDP连接
+	udpConnInterface, ok := c.udpConns.Load(connID)
+	if !ok {
+		// 创建新的UDP连接
+		conn, err := net.ListenUDP("udp", nil)
+		if err != nil {
+			return fmt.Errorf("创建UDP连接失败: %v", err)
+		}
+
+		udpConnInterface = &udpConn{
+			conn:       conn,
+			sourceAddr: sourceAddr,
+			lastActive: time.Now(),
+		}
+		c.udpConns.Store(connID, udpConnInterface)
+
+		// 启动UDP读取协程
+		go c.handleUDPResponse(connID, udpConnInterface.(*udpConn))
+	}
+
+	udpConn := udpConnInterface.(*udpConn)
+	udpConn.lastActive = time.Now()
+
+	// 发送数据到目标地址
+	if _, err := udpConn.conn.Write(data[9:]); err != nil {
+		c.cleanupUDPConnection(connID)
+		return fmt.Errorf("发送UDP数据失败: %v", err)
+	}
+
+	return nil
+}
+
+// handleUDPResponse 处理UDP响应
+func (c *Client) handleUDPResponse(connID uint32, conn *udpConn) {
+	defer c.cleanupUDPConnection(connID)
+
+	buffer := make([]byte, 64*1024)
+	for {
+		select {
+		case <-c.done:
+			return
+		default:
+			// 设置读取超时
+			conn.conn.SetReadDeadline(time.Now().Add(c.readTimeout))
+
+			// 读取UDP数据
+			n, _, err := conn.conn.ReadFromUDP(buffer)
+			if err != nil {
+				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+					// 超时检查连接是否仍然活跃
+					if time.Since(conn.lastActive) > c.readTimeout {
+						return
+					}
+					continue
+				}
+				logger.Error("读取UDP响应失败: %v", err)
+				return
+			}
+
+			// 准备响应数据
+			data := make([]byte, n+5)
+			data[0] = 3 // UDP数据包
+			binary.BigEndian.PutUint32(data[1:5], connID)
+			copy(data[5:], buffer[:n])
+
+			// 发送到隧道
+			if err := c.tunnel.Write(data); err != nil {
+				logger.Error("发送UDP响应到隧道失败: %v", err)
+				return
+			}
+
+			conn.lastActive = time.Now()
+		}
+	}
+}
+
+// cleanupUDPConnection 清理UDP连接
+func (c *Client) cleanupUDPConnection(connID uint32) {
+	if conn, ok := c.udpConns.Load(connID); ok {
+		udpConn := conn.(*udpConn)
+		udpConn.conn.Close()
+		c.udpConns.Delete(connID)
+		logger.Debug("清理UDP连接 %d", connID)
+	}
+}
+
 // Close 关闭客户端
 func (c *Client) Close() error {
 	close(c.done)
@@ -295,6 +410,14 @@ func (c *Client) Close() error {
 	c.activeConns.Range(func(key, value interface{}) bool {
 		if conn, ok := value.(*connection); ok {
 			conn.targetConn.Close()
+		}
+		return true
+	})
+
+	// 关闭所有UDP连接
+	c.udpConns.Range(func(key, value interface{}) bool {
+		if conn, ok := value.(*udpConn); ok {
+			conn.conn.Close()
 		}
 		return true
 	})
